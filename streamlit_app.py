@@ -5,35 +5,22 @@ Streamlit in Snowflake (SiS) compatible dashboard.
 Uses only packages available in the SiS environment: streamlit, pandas,
 snowflake.snowpark.
 
-Run locally:  streamlit run streamlit_app.py
 Run in SiS:   deploy as a Streamlit app in your Snowflake account.
-
-Environment variables (same as poller.py):
-  SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD,
-  SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
+(For local development, use a Snowflake external connection or run poller.py separately.)
 """
 
-import os
-from dotenv import load_dotenv
-load_dotenv() 
 import streamlit as st
 import pandas as pd
-from snowflake.snowpark.session import Session
+from snowflake.snowpark import Session
+from snowflake.snowpark.context import get_active_session
 from snowflake.snowpark.functions import col
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
 @st.cache_resource
-def get_snowpark_session() -> Session:
-    params = {
-        "account":   os.getenv("SNOWFLAKE_ACCOUNT"),
-        "user":      os.getenv("SNOWFLAKE_USER"),
-        "password":  os.getenv("SNOWFLAKE_PASSWORD"),
-        "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-        "database":  os.getenv("SNOWFLAKE_DATABASE", "FRAUD_AGENT"),
-        "schema":    os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
-    }
-    return Session.builder.configs(params).create()
+def get_snowpark_session():
+    """Get the active Snowpark session (SiS provides this automatically)."""
+    return get_active_session()
 
 
 def load_live_transactions(session: Session, limit: int = 50) -> pd.DataFrame:
@@ -173,16 +160,56 @@ with tab_txns:
                 _amount = st.number_input("Amount ($)", min_value=0.01, step=1.00)
             with c3:
                 _txn_ts = st.text_input("Transaction TS (optional, defaults to now)", placeholder="e.g. 2026-09-09 12:00:00")
+            c4, c5 = st.columns(2)
+            with c4:
+                _name_orig = st.text_input("Origin Account (NAMEORIG)", placeholder="e.g. C123456789")
+            with c5:
+                _name_dest = st.text_input("Destination Account (NAMEDEST, optional)", placeholder="e.g. M987654321")
             submitted = st.form_submit_button("Insert Transaction", use_container_width=True)
 
             if submitted:
                 ts_val = f"'{_txn_ts}'" if _txn_ts.strip() else "CURRENT_TIMESTAMP()"
+                name_dest_val = f"'{_name_dest}'" if _name_dest.strip() else "NULL"
+                
+                # 1. Insert with MODE='LIVE'
                 session.sql(
-                    f"INSERT INTO LIVE_TRANSACTIONS (TYPE, AMOUNT, TXN_TS) "
-                    f"VALUES ('{_type}', {_amount}, {ts_val})"
+                    f"INSERT INTO LIVE_TRANSACTIONS (TYPE, AMOUNT, TXN_TS, NAMEORIG, NAMEDEST, MODE) "
+                    f"VALUES ('{_type}', {_amount}, {ts_val}, '{_name_orig}', {name_dest_val}, 'LIVE')"
                 ).collect()
-                st.success(f"Inserted {_type} — ${_amount:,.2f}")
-                st.rerun()
+                
+                # 2. Run the ensemble vote on the same connection
+                session.sql("CALL run_final_ensemble_vote()").collect()
+                
+                # 3. Query FINAL_ANOMALY_VOTES for this specific transaction
+                # Use most recent TXN_TS for this NAMEORIG to handle CURRENT_TIMESTAMP() correctly
+                verdict_rows = session.sql(
+                    f"SELECT FINAL_VERDICT, HOURLY_AGG_FLAG, ZSCORE_FLAG "
+                    f"FROM FINAL_ANOMALY_VOTES "
+                    f"WHERE NAMEORIG = '{_name_orig}' "
+                    f"ORDER BY TXN_TS DESC LIMIT 1"
+                ).collect()
+                
+                if verdict_rows:
+                    v = verdict_rows[0]
+                    final_verdict = v["FINAL_VERDICT"]
+                    hourly_flag = v["HOURLY_AGG_FLAG"]
+                    zscore_flag = v["ZSCORE_FLAG"]
+                    
+                    if final_verdict == 1:
+                        reasons = []
+                        if hourly_flag == 1:
+                            reasons.append("Hourly-Aggregate Anomaly")
+                        if zscore_flag == 1:
+                            reasons.append("Per-Type Z-Score Deviation")
+                        reason_str = " + ".join(reasons)
+                        st.error(f"🚨 FLAGGED AS FRAUD — {reason_str}")
+                    else:
+                        st.success("✅ Clean — No signals fired")
+                else:
+                    st.warning("⚠️ Transaction inserted but ensemble vote returned no result yet (may need a moment)")
+                
+                # No rerun — let the verdict message stay visible
+                # The table below will reflect the new row on next interaction
 
     # ── Table + metrics (shown in both modes) ──────────────────────────────
     st.subheader("Recent Transactions" if st.session_state.mode == "Simulated" else "Live Transactions")

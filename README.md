@@ -30,9 +30,28 @@ A real-time fraud detection and response pipeline built on **Snowflake** — fro
                                                     │ Streamlit   │
                                                     │ Dashboard   │
                                                     └─────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ TWO-SIGNAL VOTING ENSEMBLE (additive, optional)                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  ZSCORE_VOTES     ──▶                                                │
+│       │           │    (OR logic)                                    │
+│       ▼           ▼                                                 │
+│  FINAL_ANOMALY_VOTES  ◀── run_final_ensemble_vote()                 │
+│       ▲           ▲                                                 │
+│       │           │                                                 │
+│  ALERTS (hourly agg)                                                │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Flow
+
+5. **Two-signal voting ensemble** (additive, does not modify the baseline pipeline):
+   - `ZSCORE_VOTES` — per-transaction z-score deviation from per-type historical mean/stddev (`TYPE_STATS` + view)
+   - `ALERTS` — existing hourly-aggregate anomaly flags from `fraud_model` (hourly bucket)
+   - `FINAL_ANOMALY_VOTES` — combined verdict table: `FINAL_VERDICT = HOURLY_AGG_FLAG OR ZSCORE_FLAG`
+   - `run_final_ensemble_vote()` — stored procedure joining on `TYPE + hour_bucket`, fully additive
+   - Runs independently on the same 60s schedule (or chained after `FRAUD_CHECK_TASK`)
 
 1. **PaySim Dataset** (~3M synthetic transactions) is loaded into `FRAUD_AGENT.PUBLIC.RAW_TRANSACTIONS` with a `TXN_TS` timestamp column.
 2. The data is split:
@@ -62,15 +81,17 @@ This design decision is intentional and demonstrated in the code: all Snowflake-
 ```
 fraud-agent/
 ├── sql/
-│   ├── 01_run_fraud_check.sql   # ALERTS table + run_fraud_check() stored proc
-│   ├── 02_stream_simulator.sql  # STREAM_WATERMARK table + stream_simulator() proc
-│   ├── 03_tasks.sql             # STREAM_SIM_TASK + FRAUD_CHECK_TASK definitions
-│   └── 04_actions_log.sql       # ACTIONS_LOG table for poller audit trail
+│   ├── 01_run_fraud_check.sql         # ALERTS table + run_fraud_check() stored proc
+│   ├── 02_stream_simulator.sql        # STREAM_WATERMARK table + stream_simulator() proc
+│   ├── 03_tasks.sql                   # STREAM_SIM_TASK + FRAUD_CHECK_TASK definitions
+│   ├── 04_actions_log.sql             # ACTIONS_LOG table for poller audit trail
+│   ├── 06_ensemble_voting.sql         # TYPE_STATS, ZSCORE_VOTES, BALANCE_CONSISTENCY_VOTES, ANOMALY_VOTES, run_ensemble_vote()
+│   └── 11_final_two_signal_ensemble.sql # FINAL_ANOMALY_VOTES + run_final_ensemble_vote() (two-signal OR ensemble)
 ├── agent/
-│   └── poller.py                # Local poller: Snowflake → Slack + account lock log + ACTIONS_LOG
-├── streamlit_app.py             # SiS-compatible dashboard
-├── requirements.txt             # Python dependencies for poller
-├── .env.example                 # Environment variable template
+│   └── poller.py                      # Local poller: Snowflake → Slack + account lock log + ACTIONS_LOG
+├── streamlit_app.py                   # SiS-compatible dashboard
+├── requirements.txt                   # Python dependencies for poller
+├── .env.example                       # Environment variable template
 ├── .gitignore
 └── README.md
 ```
@@ -87,13 +108,21 @@ fraud-agent/
 @sql/02_stream_simulator.sql
 @sql/03_tasks.sql
 @sql/04_actions_log.sql
+@sql/06_ensemble_voting.sql
+@sql/11_final_two_signal_ensemble.sql
 ```
 
 This creates:
 - `ALERTS` table (appended to by `run_fraud_check()`)
 - `STREAM_WATERMARK` table (tracks last streamed `step`)
 - `ACTIONS_LOG` table (written by the poller after each alert action)
+- `TYPE_STATS` table (per-type mean/stddev for z-score)
+- `ZSCORE_VOTES` view (per-transaction z-score flags)
+- `BALANCE_CONSISTENCY_VOTES` view (balance-consistency flags)
+- `ANOMALY_VOTES` table (3-signal majority vote)
+- `FINAL_ANOMALY_VOTES` table (2-signal OR ensemble: hourly-agg + z-score)
 - `run_fraud_check()` and `stream_simulator()` stored procedures
+- `run_ensemble_vote()` and `run_final_ensemble_vote()` stored procedures
 - `STREAM_SIM_TASK` and `FRAUD_CHECK_TASK` (both running every 60 seconds)
 
 ### 2. Local — Configure environment
